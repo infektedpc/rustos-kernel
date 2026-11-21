@@ -1,0 +1,40 @@
+[package]
+name = "rustos-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "RustOS kernel: no_std x86-64 kernel using bootloader_api 0.11 — VGA + serial output, GDT, IDT, heap."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "rustos_kernel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustos-kernel"
+path = "src/main.rs"
+# The binary is a freestanding kernel (no main, no std); it cannot be
+# built as a host test target. `cargo test` runs the library unit tests.
+test = false
+
+[dependencies]
+# Kernel-side half of bootloader 0.11: entry_point! + BootInfo.
+# (The host-side half, `bootloader`, lives in rustos-bootloader.)
+bootloader_api = "0.11"
+# Default features include `nightly`, which enables the
+# `extern "x86-interrupt"` ABI used by the IDT handlers. This crate
+# therefore requires a nightly toolchain (see rust-toolchain.toml).
+x86_64 = "0.15"
+linked_list_allocator = "0.10"
+spin = "0.10"
+uart_16550 = "0.4"
+# `spin_no_std` is required: without it lazy_static needs `std`, which
+# does not exist for x86_64-unknown-none.
+lazy_static = { version = "1.5", features = ["spin_no_std"] }
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"
+# Note: cargo test ignores `panic` for the test profile (it forces
+# unwinding so the harness can report failures), so the unit tests
+# still work despite panic = "abort" above.

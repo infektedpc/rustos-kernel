@@ -1,0 +1,8 @@
+[toolchain]
+# The kernel needs nightly for the `extern "x86-interrupt"` ABI used by
+# the IDT handlers (see src/interrupts.rs). Stable rustc 1.99.1 rejects
+# that ABI (E0658, rust-lang/rust#40180). rustup selects this toolchain
+# automatically whenever cargo runs inside this directory.
+channel = "nightly"
+components = ["rust-src", "llvm-tools-preview"]
+targets = ["x86_64-unknown-none"]

@@ -1,0 +1,8 @@
+# Build the kernel for the bare-metal target by default, so plain
+# `cargo build` produces the kernel ELF (not a host binary).
+# Host unit tests still run with an explicit host target:
+#   cargo test --target x86_64-unknown-linux-gnu
+# (plain `cargo test` would try to *run* tests on x86_64-unknown-none,
+# which has no OS to run them under.)
+[build]
+target = "x86_64-unknown-none"
