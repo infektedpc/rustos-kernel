@@ -69,16 +69,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustos-interrupts"
+version = "0.1.0"
+
+[[package]]
 name = "rustos-kernel"
 version = "0.1.0"
 dependencies = [
  "bootloader_api",
  "lazy_static",
  "linked_list_allocator",
+ "rustos-interrupts",
+ "rustos-scheduler",
  "spin 0.10.1",
  "uart_16550",
  "x86_64",
 ]
+
+[[package]]
+name = "rustos-scheduler"
+version = "0.1.0"
 
 [[package]]
 name = "rustversion"

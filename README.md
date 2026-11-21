@@ -9,13 +9,22 @@ output, GDT + TSS, IDT, paging, and a heap.
 1. Receives `BootInfo` from the bootloader (`entry_point!`).
 2. Prints a banner on VGA and on serial COM1.
 3. Loads the GDT (kernel code segment + TSS with a dedicated
-   double-fault stack) and the IDT (breakpoint, double-fault, page-fault
-   handlers).
+   double-fault stack) and the IDT (breakpoint, double-fault,
+   page-fault, timer, and keyboard handlers).
 4. Builds an `OffsetPageTable` from the bootloader's physical-memory
    mapping and a frame allocator from the `Usable` memory regions.
 5. Maps a 100 KiB heap and proves it with `Box`, `Vec`, and `Rc`.
-6. Triggers a breakpoint (`int3`) to prove the IDT works, prints that it
-   survived, and halts.
+6. Initialises interrupts (`interrupts::init_interrupts`): PIC
+   remap (master -> 32, slave -> 40), PIT at 100 Hz, APIC MMIO
+   pages mapped + LAPIC enabled (IOAPIC entries for IRQ0/IRQ1
+   programmed but masked — delivery stays with the PIC), IRQ0/IRQ1
+   unmasked, interrupts enabled (`sti`).
+7. Triggers a breakpoint (`int3`) to prove the IDT works, prints that it
+   survived, and enters the idle loop: `hlt` until the next
+   interrupt, drain queued keystrokes (echoing printable
+   characters), act on timer preempt requests, print uptime every
+   5 s. The kernel no longer halts after booting — it idles on the
+   timer interrupt.
 
 ## Build (needs nightly)
 
@@ -53,6 +62,12 @@ the host). Tests cover:
 - the heap allocator (allocate into a scratch heap, write, free, and
   reallocate — the same `linked_list_allocator::Heap` the kernel uses,
   exercised as a local heap so the test harness keeps its own allocator).
+- the interrupt handler logic, factored so host tests can drive it:
+  the timer step calls the scheduler tick exactly at quantum
+  boundaries (first tick at 100 Hz, tenth at a 10-tick quantum) and
+  preempts to the other task; the keyboard step decodes scancodes
+  into queued events; EOI for vector 33 goes to the PIC; a preempt
+  request with no running task is dropped without panicking.
 
 Plain `cargo test` (no `--target`) does **not** work: the default build
 target is `x86_64-unknown-none`, which has no OS to run tests under.
@@ -80,8 +95,13 @@ qemu-system-x86_64 -drive file=disk.img,format=raw \
 - `src/vga.rs` — VGA text writer (0xb8000, 80x25).
 - `src/serial.rs` — COM1 serial writer (0x3F8).
 - `src/gdt.rs` — GDT + TSS + double-fault IST stack.
-- `src/interrupts.rs` — IDT: breakpoint, double-fault, page-fault.
-- `src/memory.rs` — page-table init, `BootInfoFrameAllocator`, heap.
+- `src/interrupts.rs` — IDT (breakpoint, double-fault, page-fault,
+  timer, keyboard) + controller setup: PIC remap, PIT 100 Hz, APIC
+  init, IRQ0/IRQ1 unmask, `sti`; timer -> scheduler tick,
+  keyboard -> 64-entry event ring; `maybe_reschedule` for the idle
+  loop; `switch_to_apic_mode` (not called at boot — see below).
+- `src/memory.rs` — page-table init, `BootInfoFrameAllocator`, heap,
+  `map_mmio_page` for device register pages (LAPIC/IOAPIC).
 
 ## Known limitations
 
@@ -89,10 +109,21 @@ qemu-system-x86_64 -drive file=disk.img,format=raw \
   BIOS/SeaBIOS boot and VGA-compatible firmware, but a pure UEFI/GOP
   boot has no text mode — there the serial log (`-serial stdio`) is the
   output that works, and a framebuffer writer is still to be written.
-- **No timer/keyboard interrupts yet.** The IDT only serves CPU
-  exceptions; the PICs are not remapped, so no hardware IRQs are
-  enabled. That is the next step, along with a keyboard driver.
-- **No filesystem, scheduler, or userspace yet.** The heap, paging,
+- **Timer/keyboard interrupts are in, but not live-boot tested.**
+  The IDT has timer (vector 32) and keyboard (vector 33) handlers,
+  the PIC is remapped, the PIT runs at 100 Hz, and the LAPIC is
+  enabled with IOAPIC entries programmed (masked — delivery stays
+  with the PIC). All of it is verified by host unit tests against
+  mock ports/registers only. The PIC -> APIC mode switch
+  (`switch_to_apic_mode`) is implemented but not called at boot and
+  not verified on hardware. The APIC bases are defaults
+  (0xFEE00000 / 0xFEC00000), not discovered from ACPI/MADT.
+- **No tasks in the kernel yet.** The scheduler exists and the timer
+  IRQ calls `tick()` on every tick, but the kernel creates no tasks,
+  so `tick()` always returns `Continue` and `maybe_reschedule`
+  has nothing to switch to. Adding a first task (shell) is the next
+  step.
+- **No filesystem or userspace yet.** The heap, paging,
   and exception handling in this repo are the foundation those build on.
 - **Not live-boot tested here.** QEMU is not installed in this sandbox,
   so the kernel is verified by `cargo build` for the target plus the

@@ -18,7 +18,7 @@ use bootloader_api::config::Mapping;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
 use rustos_kernel::memory::BootInfoFrameAllocator;
-use rustos_kernel::{gdt, interrupts, memory, println, serial_println, hlt_loop};
+use rustos_kernel::{gdt, interrupts, memory, print, println, serial_println, hlt_loop};
 use x86_64::VirtAddr;
 
 /// Bootloader configuration for this kernel.
@@ -62,15 +62,45 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     println!("heap test: Box={} Vec len={} Rc strong={}", heap_value, rc.len(), Rc::strong_count(&rc));
     serial_println!("heap test: ok (Box, Vec, Rc)");
 
+    // Bring up hardware interrupts: PIC remap, PIT at 100 Hz, APIC
+    // pages mapped + LAPIC enabled (IOAPIC entries programmed but
+    // masked — delivery stays with the PIC), IRQ0/IRQ1 unmasked, sti.
+    // From here the timer fires and keys queue into the ring buffer.
+    interrupts::init_interrupts(&mut mapper, &mut frame_allocator);
+    serial_println!("interrupts: PIC remap + PIT 100 Hz + APIC init done, sti");
+
     // Prove the breakpoint exception works: int3 should print the stack
     // frame via the IDT handler and return here.
     println!("triggering breakpoint exception...");
     x86_64::instructions::interrupts::int3();
     println!("breakpoint handled, back in kernel_main.");
 
-    println!("RustOS kernel ready. Halting.");
-    serial_println!("RustOS kernel ready. Halting.");
-    hlt_loop();
+    idle_loop();
+}
+
+/// Idle loop: halt until the next interrupt, then drain any queued
+/// keystrokes (echoing printable characters), act on a pending
+/// preempt request from the timer IRQ, and report uptime every
+/// 500 ticks (5 s at 100 Hz). The PIT fires at 100 Hz, so this wakes
+/// ~100 times a second even with no keys pressed.
+fn idle_loop() -> ! {
+    println!("RustOS kernel ready. Timer + keyboard interrupts live; type something.");
+    serial_println!("RustOS kernel ready. Timer + keyboard interrupts live.");
+    let mut last_printed_ticks = 0u64;
+    loop {
+        x86_64::instructions::hlt();
+        interrupts::maybe_reschedule();
+        while let Some(event) = interrupts::pop_key_event() {
+            if let Some(ch) = event.ch {
+                print!("{}", ch);
+            }
+        }
+        let ticks = interrupts::timer_ticks();
+        if ticks >= last_printed_ticks + 500 {
+            println!("uptime: {} ticks ({} ms)", ticks, ticks * 10);
+            last_printed_ticks = ticks;
+        }
+    }
 }
 
 /// Panic handler: report on VGA and serial, then halt.

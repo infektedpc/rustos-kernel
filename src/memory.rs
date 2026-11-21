@@ -97,6 +97,32 @@ pub fn init_heap(
     Ok(())
 }
 
+/// Map one 4 KiB MMIO page identity-mapped (virtual address ==
+/// physical address) with PRESENT | WRITABLE | NO_CACHE, so the kernel
+/// can touch a device's registers (e.g. the LAPIC at `0xFEE00000` and
+/// the IOAPIC at `0xFEC00000`). The frame is the device's own address,
+/// not one from the allocator — the allocator is only used for the
+/// intermediate page-table frames `map_to` may need.
+///
+/// # Safety
+///
+/// The caller must guarantee `phys_addr` really is a device register
+/// page (mapping RAM as uncacheable MMIO, or mapping the wrong device,
+/// corrupts the machine's view of memory).
+pub fn map_mmio_page(
+    mapper: &mut OffsetPageTable,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_addr: u64,
+) -> Result<(), MapToError<Size4KiB>> {
+    let page = Page::containing_address(VirtAddr::new(phys_addr));
+    let frame = PhysFrame::containing_address(PhysAddr::new(phys_addr));
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+    unsafe {
+        mapper.map_to(page, frame, flags, frame_allocator)?.flush();
+    }
+    Ok(())
+}
+
 /// A frame allocator backed by the bootloader's memory map.
 ///
 /// Yields each 4 KiB frame of every `Usable` region exactly once, in

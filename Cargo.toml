@@ -27,6 +27,10 @@ x86_64 = "0.15"
 linked_list_allocator = "0.10"
 spin = "0.10"
 uart_16550 = "0.4"
+# Sibling crates (path deps): the interrupt controllers + handlers
+# and the scheduler the timer IRQ drives.
+rustos-interrupts = { path = "../rustos-interrupts" }
+rustos-scheduler = { path = "../rustos-scheduler" }
 # `spin_no_std` is required: without it lazy_static needs `std`, which
 # does not exist for x86_64-unknown-none.
 lazy_static = { version = "1.5", features = ["spin_no_std"] }
