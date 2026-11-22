@@ -13,8 +13,71 @@
 //! pointer intrinsics is stable across all of them.
 
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
+use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, Size4KiB};
+use x86_64::VirtAddr;
+
+/// Physical address of the VGA text-mode buffer (80x25, 16 colours).
+pub const VGA_TEXT_BUFFER_ADDR: u64 = 0xb8000;
+
+/// Whether the VGA text buffer is safe to write to.
+///
+/// The bootloader never maps `0xb8000` under UEFI/GOP, so the buffer
+/// is unmapped when the kernel starts: the first VGA write then
+/// page-faults. [`init`] maps it (or finds it already mapped) and
+/// sets this flag; [`_print`] drops all VGA output while the flag is
+/// clear, so the kernel degrades to serial-only output instead of
+/// faulting on a hope. Defaults to `false`: VGA stays off until the
+/// mapping is proven, never the other way round.
+static VGA_AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the VGA text buffer is mapped and safe to write to.
+pub fn vga_available() -> bool {
+    VGA_AVAILABLE.load(Ordering::SeqCst)
+}
+
+/// Map the VGA text buffer so [`_print`] can use it, and report
+/// whether it is now safe to write to.
+///
+/// The page at `0xb8000` is mapped identity-mapped (virtual address
+/// == physical address) with PRESENT | WRITABLE | NO_CACHE, via
+/// [`crate::memory::map_mmio_page`]. If the bootloader or firmware
+/// already mapped it (as on the first live boot, 2026-11-21), the
+/// existing mapping is kept and this just records that VGA is usable.
+///
+/// Returns `true` when VGA output is safe, `false` when the mapping
+/// could not be established — in that case the caller must not print
+/// to VGA at all, and the kernel runs serial-only. The mapping itself
+/// cannot be host-tested; see the module tests for what is covered.
+///
+/// # Safety
+///
+/// The caller must pass the kernel's live page-table mapper and a
+/// frame allocator over genuinely free frames (only used for the
+/// intermediate page-table frames `map_to` may need).
+pub fn init(
+    mapper: &mut OffsetPageTable,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> bool {
+    let page: Page<Size4KiB> =
+        Page::containing_address(VirtAddr::new(VGA_TEXT_BUFFER_ADDR));
+    // Already mapped (firmware/bootloader left it)? Keep it and
+    // record VGA as usable — mapping it again would fail with
+    // `PageAlreadyMapped` and wrongly force serial-only mode.
+    if mapper.translate_page(page).is_ok() {
+        VGA_AVAILABLE.store(true, Ordering::SeqCst);
+        return true;
+    }
+    match crate::memory::map_mmio_page(mapper, frame_allocator, VGA_TEXT_BUFFER_ADDR) {
+        Ok(()) => {
+            VGA_AVAILABLE.store(true, Ordering::SeqCst);
+            true
+        }
+        Err(_) => false,
+    }
+}
 
 /// Number of character cells per VGA text row.
 pub const BUFFER_WIDTH: usize = 80;
@@ -76,14 +139,16 @@ pub type Buffer = [[ScreenChar; BUFFER_WIDTH]; BUFFER_HEIGHT];
 
 /// The VGA text buffer in the kernel's address space.
 ///
-/// Writing to this address only works where the firmware left the VGA
-/// text buffer mapped — BIOS boot and VGA-compatible firmware. Under a
-/// pure UEFI/GOP boot there is no text buffer, and output goes to the
-/// serial port instead (see `crate::serial`).
+/// Writing to this address only works after [`init`] has mapped it
+/// (or found it already mapped). Before that, [`_print`] refuses to
+/// write at all — see `VGA_AVAILABLE`. Callers must never touch this
+/// buffer except through [`_print`] / the `print!` macros, which are
+/// guarded by the flag.
 pub fn vga_buffer() -> &'static mut Buffer {
     // SAFETY: 0xb8000 is the conventional VGA text buffer address.
-    // The caller must be running on hardware/firmware where it is mapped.
-    unsafe { &mut *(0xb8000 as *mut Buffer) }
+    // The caller must have mapped it first (see `init`); the global
+    // writer is only reached through `_print`, which checks that.
+    unsafe { &mut *(VGA_TEXT_BUFFER_ADDR as *mut Buffer) }
 }
 
 /// A writer over a VGA text buffer.
@@ -200,8 +265,17 @@ lazy_static! {
 
 /// Write formatted arguments to the global VGA writer.
 /// Used by the `print!` / `println!` macros.
+///
+/// Silently drops the output while the VGA text buffer is unmapped
+/// (see `VGA_AVAILABLE` / [`init`]): writing to `0xb8000` before the
+/// kernel maps it page-faults, and a fault before the IDT is up is a
+/// triple fault. Serial output is a separate path (`crate::serial`)
+/// and is unaffected.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
+    if !VGA_AVAILABLE.load(Ordering::SeqCst) {
+        return;
+    }
     use core::fmt::Write;
     WRITER.lock().write_fmt(args).unwrap();
 }
@@ -299,5 +373,23 @@ mod tests {
         assert_eq!(writer.read_char(0, 0).ascii_character, b'n');
         assert_eq!(writer.read_char(0, 2).ascii_character, b'4');
         assert_eq!(writer.read_char(0, 3).ascii_character, b'2');
+    }
+
+    #[test]
+    fn vga_is_unavailable_until_init_maps_it() {
+        // The flag starts clear and only `init` (which needs a real
+        // page-table mapper, so it cannot run on the host) can set it.
+        assert!(!vga_available());
+    }
+
+    #[test]
+    fn print_is_a_noop_while_vga_is_unavailable() {
+        // This is the guard that stops the 2026-11-21 triple fault:
+        // `_print` must never touch `0xb8000` while the buffer is
+        // unmapped. On the host, touching that address would segfault
+        // the test process, so merely returning from this call proves
+        // the guard holds.
+        assert!(!vga_available());
+        _print(format_args!("this must never reach 0xb8000"));
     }
 }

@@ -20,30 +20,51 @@
 //!   EOI is always sent, even when no byte was waiting or the ring
 //!   was full, so the controller never wedges.
 //!
+//! Every CPU exception vector (0-21, plus 28-30) has a handler, so no
+//! fault ever escalates silently to a double fault again: each prints
+//! the vector name, the error code where the CPU pushes one, and the
+//! stack frame to VGA and serial, then halts. (Breakpoint returns;
+//! double fault panics.) All gates are built with the code selector
+//! returned by [`gdt::init()`] — never the live `CS` the x86_64 crate
+//! would otherwise read at build time.
+//!
+//! The LAPIC stays **off** until [`switch_to_apic_mode`] is actually
+//! called. On 2026-11-21 the boot path enabled the LAPIC (spurious
+//! vector `0xFF`, timer + LINTs masked) while the PIC still owned
+//! delivery — and the first timer IRQ after `sti` arrived with no
+//! valid vector attached (QEMU `-d int` showed `v=ffffffff`, then
+//! #GP with error `0xfffa`). The gate dump had already proved the
+//! IDT gates good, so the fault was in the controller, not the table:
+//! with LINT0 masked, the PIC's INTR reached the CPU through the
+//! enabled LAPIC and there was no vector to deliver. Boot is
+//! therefore PIC-only from end to end; the APIC pages are mapped and
+//! `init_apic` runs only inside `switch_to_apic_mode`.
+//!
 //! ## Boot sequence ([`init_interrupts`])
 //!
 //! 1. Interrupts disabled.
 //! 2. PIC remap (master -> 32, slave -> 40), IRQ0 + IRQ1 unmasked.
 //! 3. PIT programmed to 100 Hz.
-//! 4. APIC MMIO pages mapped (LAPIC `0xFEE00000`, IOAPIC
-//!    `0xFEC00000`) and [`init_apic`] run: LAPIC enabled (spurious
-//!    vector `0xFF`), APIC timer + LINTs masked, IOAPIC entries for
-//!    IRQ0/IRQ1 programmed but **masked** — delivery stays with the
-//!    PIC, so nothing is double-delivered. If the pages cannot be
-//!    mapped, boot continues in PIC mode with a serial warning.
+//! 4. The IDT gates for vectors 32/33 are dumped to serial a second
+//!    time, right before `sti`. If a page mapping made after the
+//!    `init_idt` dump corrupted the IDT, this is where it shows up —
+//!    and it discriminates that from a controller fault: gates good
+//!    here plus a #GP at `sti` means the interrupt controller, not
+//!    the table.
 //! 5. Interrupts enabled (`sti`). From here the timer fires at 100 Hz
 //!    and keys queue into the ring buffer.
 //!
 //! ## PIC vs APIC mode
 //!
 //! Boot is always PIC mode: the 8259s deliver IRQ0/IRQ1 and EOI goes
-//! to the PIC. [`switch_to_apic_mode`] hands delivery to the IOAPIC
-//! (masks the PIC, unmasks the IOAPIC entries) and switches EOI to
-//! the LAPIC — but it is **not** called from `kernel_main` yet: the
-//! switch has not been verified on real hardware (no QEMU on this
-//! VM), and a wrong IOAPIC base or APIC id would silently lose the
-//! timer. The APIC bases are the defaults, not discovered from
-//! ACPI/MADT, and the APIC base is not read from the MSR — see the
+//! to the PIC. [`switch_to_apic_mode`] maps the APIC MMIO pages,
+//! runs [`init_apic`], then hands delivery to the IOAPIC (masks the
+//! PIC, unmasks the IOAPIC entries) and switches EOI to the LAPIC —
+//! but it is **not** called from `kernel_main` yet: the switch has
+//! not been verified on real hardware (no QEMU on this VM), and a
+//! wrong IOAPIC base or APIC id would silently lose the timer. The
+//! APIC bases are the defaults, not discovered from ACPI/MADT, and
+//! the APIC base is not read from the MSR — see the
 //! `rustos-interrupts` README.
 
 use crate::memory::map_mmio_page;
@@ -59,6 +80,7 @@ use rustos_interrupts::{
 use rustos_interrupts::{pit};
 use rustos_scheduler::{switch, Scheduler, TaskId, TickOutcome};
 use spin::Mutex;
+use x86_64::structures::gdt::SegmentSelector;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{FrameAllocator, OffsetPageTable, Size4KiB};
@@ -72,8 +94,9 @@ pub const TIMER_HZ: u32 = 100;
 lazy_static! {
     static ref PIC: Mutex<Pic<RealPorts>> = Mutex::new(Pic::new(RealPorts));
 }
-// Local APIC, once its MMIO page is mapped (see `init_interrupts`).
-// `None` until then — and forever, if the pages could not be mapped.
+// Local APIC, once its MMIO page is mapped (see
+// `switch_to_apic_mode`). `None` until then — and forever in PIC
+// mode: the LAPIC stays off at boot (see the module docs).
 lazy_static! {
     static ref LAPIC: Mutex<Option<LocalApic<VolatileRegWindow>>> = Mutex::new(None);
 }
@@ -104,25 +127,127 @@ static MODE: AtomicU8 = AtomicU8::new(0);
 /// loop — never switched inside the interrupt handler itself.
 static NEED_RESCHED: AtomicU64 = AtomicU64::new(0);
 
+/// Build the IDT with an explicit code selector on every entry.
+///
+/// The x86_64 crate's `set_handler_fn` fills each gate's code
+/// selector from the live `CS` register at build time. That was the
+/// first suspect for the 2026-11-21 #GP (error code 0xFFFA) at the
+/// first timer IRQ after `sti` — but the `init_idt` gate dump proved
+/// the gates good (index 1, present), and the fault turned out to be
+/// the LAPIC being enabled while the PIC still owned delivery (see
+/// the module docs). The explicit selector stays anyway: it removes
+/// one variable from the table entirely, and `init_idt` dumps gates
+/// 32/33 to serial so every boot proves it.
+fn build_idt(cs: SegmentSelector) -> InterruptDescriptorTable {
+    let mut idt = InterruptDescriptorTable::new();
+    unsafe {
+        idt.divide_error
+            .set_handler_fn(divide_error_handler)
+            .set_code_selector(cs);
+        idt.debug
+            .set_handler_fn(debug_handler)
+            .set_code_selector(cs);
+        idt.non_maskable_interrupt
+            .set_handler_fn(nmi_handler)
+            .set_code_selector(cs);
+        idt.breakpoint
+            .set_handler_fn(breakpoint_handler)
+            .set_code_selector(cs);
+        idt.overflow
+            .set_handler_fn(overflow_handler)
+            .set_code_selector(cs);
+        idt.bound_range_exceeded
+            .set_handler_fn(bound_range_handler)
+            .set_code_selector(cs);
+        idt.invalid_opcode
+            .set_handler_fn(invalid_opcode_handler)
+            .set_code_selector(cs);
+        idt.device_not_available
+            .set_handler_fn(device_not_available_handler)
+            .set_code_selector(cs);
+        idt.double_fault
+            .set_handler_fn(double_fault_handler)
+            .set_code_selector(cs)
+            .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+        idt.invalid_tss
+            .set_handler_fn(invalid_tss_handler)
+            .set_code_selector(cs);
+        idt.segment_not_present
+            .set_handler_fn(segment_not_present_handler)
+            .set_code_selector(cs);
+        idt.stack_segment_fault
+            .set_handler_fn(stack_segment_fault_handler)
+            .set_code_selector(cs);
+        idt.general_protection_fault
+            .set_handler_fn(general_protection_fault_handler)
+            .set_code_selector(cs);
+        idt.page_fault
+            .set_handler_fn(page_fault_handler)
+            .set_code_selector(cs);
+        idt.x87_floating_point
+            .set_handler_fn(x87_floating_point_handler)
+            .set_code_selector(cs);
+        idt.alignment_check
+            .set_handler_fn(alignment_check_handler)
+            .set_code_selector(cs);
+        idt.machine_check
+            .set_handler_fn(machine_check_handler)
+            .set_code_selector(cs);
+        idt.simd_floating_point
+            .set_handler_fn(simd_floating_point_handler)
+            .set_code_selector(cs);
+        idt.virtualization
+            .set_handler_fn(virtualization_handler)
+            .set_code_selector(cs);
+        idt.cp_protection_exception
+            .set_handler_fn(cp_protection_handler)
+            .set_code_selector(cs);
+        idt.hv_injection_exception
+            .set_handler_fn(hv_injection_handler)
+            .set_code_selector(cs);
+        idt.vmm_communication_exception
+            .set_handler_fn(vmm_communication_handler)
+            .set_code_selector(cs);
+        idt.security_exception
+            .set_handler_fn(security_exception_handler)
+            .set_code_selector(cs);
+        idt[TIMER_VECTOR]
+            .set_handler_fn(timer_interrupt_handler)
+            .set_code_selector(cs);
+        idt[KEYBOARD_VECTOR]
+            .set_handler_fn(keyboard_interrupt_handler)
+            .set_code_selector(cs);
+    }
+    idt
+}
+
 lazy_static! {
-    static ref IDT: InterruptDescriptorTable = {
-        let mut idt = InterruptDescriptorTable::new();
-        idt.breakpoint.set_handler_fn(breakpoint_handler);
-        unsafe {
-            idt.double_fault
-                .set_handler_fn(double_fault_handler)
-                .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
-        }
-        idt.page_fault.set_handler_fn(page_fault_handler);
-        idt[TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
-        idt[KEYBOARD_VECTOR].set_handler_fn(keyboard_interrupt_handler);
-        idt
-    };
+    static ref IDT: InterruptDescriptorTable = build_idt(gdt::code_selector());
 }
 
 /// Load the IDT. Call once, early in `kernel_main`, after `gdt::init()`.
+///
+/// After loading, dumps the IDTR and the timer/keyboard gates to
+/// serial: handler address + code selector for vectors 32/33, so a
+/// bad gate is visible in the boot log before the first IRQ fires.
 pub fn init_idt() {
     IDT.load();
+    dump_idt_gates();
+}
+
+/// Print the loaded IDT's base/limit and the timer + keyboard gates
+/// (handler address, code selector, present bit) to serial.
+fn dump_idt_gates() {
+    use x86_64::instructions::tables::sidt;
+
+    let idtr = sidt();
+    serial_println!(
+        "idt: base={:#x} limit={:#x}",
+        idtr.base.as_u64(),
+        idtr.limit
+    );
+    serial_println!("idt[32] timer: {:?}", IDT[TIMER_VECTOR]);
+    serial_println!("idt[33] keyboard: {:?}", IDT[KEYBOARD_VECTOR]);
 }
 
 /// Which controller currently delivers hardware IRQs.
@@ -151,17 +276,19 @@ pub fn keyboard_dropped() -> u64 {
 
 /// Initialise the interrupt controllers and enable interrupts.
 ///
-/// Order: interrupts off -> PIC remap + unmask IRQ0/IRQ1 -> PIT at
-/// 100 Hz -> map APIC pages + `init_apic` (LAPIC on, IOAPIC entries
-/// programmed but masked) -> interrupts on. Delivery stays with the
-/// PIC; see the module docs for the APIC mode switch.
+/// PIC-only by design. Order: interrupts off -> PIC remap + unmask
+/// IRQ0/IRQ1 -> PIT at 100 Hz -> re-dump the IDT gates -> interrupts
+/// on. The LAPIC is deliberately left off here: on 2026-11-21
+/// enabling it (with LINT0 masked) while the PIC still owned
+/// delivery made the first timer IRQ arrive with no valid vector
+/// (`v=ffffffff` in the QEMU log, then #GP) — so the APIC pages are
+/// mapped and `init_apic` runs only inside [`switch_to_apic_mode`],
+/// when the APIC-mode switch is actually requested.
 ///
 /// Call after `gdt::init()`, `init_idt()`, paging, and the heap are
-/// up (the APIC page mapping needs the mapper + frame allocator).
-pub fn init_interrupts(
-    mapper: &mut OffsetPageTable,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) {
+/// up. Takes no mapper: nothing in the PIC-only boot path maps
+/// pages anymore.
+pub fn init_interrupts() {
     use x86_64::instructions::interrupts;
 
     interrupts::disable();
@@ -177,25 +304,12 @@ pub fn init_interrupts(
         pit::init(&mut ports, TIMER_HZ);
     }
 
-    match map_apic_pages(mapper, frame_allocator) {
-        Ok(()) => {
-            let mut lapic =
-                LocalApic::new(unsafe { VolatileRegWindow::new(LAPIC_BASE as usize) });
-            let mut ioapic =
-                IoApic::new(unsafe { VolatileRegWindow::new(IOAPIC_BASE as usize) });
-            // BSP APIC id 0. Entries stay masked: the PIC still owns
-            // delivery until switch_to_apic_mode() is called.
-            init_apic(&mut lapic, &mut ioapic, 0);
-            *LAPIC.lock() = Some(lapic);
-            *IOAPIC.lock() = Some(ioapic);
-        }
-        Err(e) => {
-            serial_println!(
-                "interrupts: APIC pages could not be mapped ({:?}); continuing in PIC mode",
-                e
-            );
-        }
-    }
+    // Second gate dump, right before `sti`: if a page mapping made
+    // after the `init_idt` dump corrupted the IDT, this is where it
+    // shows up. Gates good here plus a #GP at `sti` would mean the
+    // interrupt controller, not the table.
+    serial_println!("interrupts: IDT gates before sti:");
+    dump_idt_gates();
 
     MODE.store(0, Ordering::SeqCst);
     interrupts::enable();
@@ -211,16 +325,42 @@ fn map_apic_pages(
     Ok(())
 }
 
-/// Switch IRQ delivery from the PIC to the IOAPIC: mask every PIC
-/// line, unmask the IOAPIC entries for IRQ0/IRQ1, and route EOI to
-/// the LAPIC from here on.
+/// Switch IRQ delivery from the PIC to the IOAPIC: map the APIC MMIO
+/// pages and run [`init_apic`] first (LAPIC on, IOAPIC entries
+/// programmed but still masked), then mask every PIC line, unmask
+/// the IOAPIC entries for IRQ0/IRQ1, and route EOI to the LAPIC from
+/// here on.
 ///
 /// NOT called from `kernel_main` yet. The switch changes which
 /// controller owns the timer and keyboard, and it has not been
-/// verified on real hardware (no QEMU on this VM). Only call it
-/// after [`init_interrupts`] has mapped the APIC pages; if the APIC
-/// was never initialised it prints a warning and stays in PIC mode.
-pub fn switch_to_apic_mode() {
+/// verified on real hardware (no QEMU on this VM). Only call it when
+/// the APIC-mode switch is actually wanted: the LAPIC must stay off
+/// while the PIC owns delivery (see the module docs). If the APIC
+/// pages cannot be mapped it prints a warning and stays in PIC mode.
+pub fn switch_to_apic_mode(
+    mapper: &mut OffsetPageTable,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) {
+    match map_apic_pages(mapper, frame_allocator) {
+        Ok(()) => {
+            let mut lapic =
+                LocalApic::new(unsafe { VolatileRegWindow::new(LAPIC_BASE as usize) });
+            let mut ioapic =
+                IoApic::new(unsafe { VolatileRegWindow::new(IOAPIC_BASE as usize) });
+            // BSP APIC id 0. Entries stay masked until the switch
+            // below unmasks them.
+            init_apic(&mut lapic, &mut ioapic, 0);
+            *LAPIC.lock() = Some(lapic);
+            *IOAPIC.lock() = Some(ioapic);
+        }
+        Err(e) => {
+            serial_println!(
+                "switch_to_apic_mode: APIC pages could not be mapped ({:?}); staying in PIC mode",
+                e
+            );
+            return;
+        }
+    }
     let mut ioapic_guard = IOAPIC.lock();
     let Some(ioapic) = ioapic_guard.as_mut() else {
         serial_println!("switch_to_apic_mode: APIC not initialised; staying in PIC mode");
@@ -330,6 +470,95 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
+/// Report an exception on VGA and serial, then halt. The `hlt_loop`
+/// at the end never returns, so this is the body for every fault
+/// handler except breakpoint (which returns) and double fault (which
+/// panics with the frame instead).
+fn report_exception(name: &str, error_code: Option<u64>, stack_frame: &InterruptStackFrame) -> ! {
+    println!("EXCEPTION: {}", name);
+    if let Some(code) = error_code {
+        println!("Error Code: {:#x}", code);
+    }
+    println!("{:#?}", stack_frame);
+    serial_println!("EXCEPTION: {}", name);
+    if let Some(code) = error_code {
+        serial_println!("Error Code: {:#x}", code);
+    }
+    serial_println!("{:#?}", stack_frame);
+    hlt_loop();
+}
+
+/// Define an `extern "x86-interrupt"` handler for an exception that
+/// pushes no error code: report it and halt.
+macro_rules! exception_handler {
+    ($name:ident, $label:expr) => {
+        extern "x86-interrupt" fn $name(stack_frame: InterruptStackFrame) {
+            report_exception($label, None, &stack_frame);
+        }
+    };
+}
+
+/// Define an `extern "x86-interrupt"` handler for an exception that
+/// pushes an error code: report it (with the code) and halt.
+macro_rules! exception_handler_with_err_code {
+    ($name:ident, $label:expr) => {
+        extern "x86-interrupt" fn $name(stack_frame: InterruptStackFrame, error_code: u64) {
+            report_exception($label, Some(error_code), &stack_frame);
+        }
+    };
+}
+
+exception_handler!(divide_error_handler, "DIVIDE ERROR");
+exception_handler!(debug_handler, "DEBUG");
+exception_handler!(nmi_handler, "NON-MASKABLE INTERRUPT");
+exception_handler!(overflow_handler, "OVERFLOW");
+exception_handler!(bound_range_handler, "BOUND RANGE EXCEEDED");
+exception_handler!(invalid_opcode_handler, "INVALID OPCODE");
+exception_handler!(device_not_available_handler, "DEVICE NOT AVAILABLE");
+exception_handler!(x87_floating_point_handler, "X87 FLOATING POINT");
+exception_handler!(simd_floating_point_handler, "SIMD FLOATING POINT");
+exception_handler!(virtualization_handler, "VIRTUALIZATION");
+exception_handler!(hv_injection_handler, "HV INJECTION");
+
+exception_handler_with_err_code!(invalid_tss_handler, "INVALID TSS");
+exception_handler_with_err_code!(segment_not_present_handler, "SEGMENT NOT PRESENT");
+exception_handler_with_err_code!(stack_segment_fault_handler, "STACK SEGMENT FAULT");
+exception_handler_with_err_code!(alignment_check_handler, "ALIGNMENT CHECK");
+exception_handler_with_err_code!(cp_protection_handler, "CONTROL PROTECTION");
+exception_handler_with_err_code!(vmm_communication_handler, "VMM COMMUNICATION");
+exception_handler_with_err_code!(security_exception_handler, "SECURITY EXCEPTION");
+
+extern "x86-interrupt" fn machine_check_handler(stack_frame: InterruptStackFrame) -> ! {
+    report_exception("MACHINE CHECK", None, &stack_frame);
+}
+
+extern "x86-interrupt" fn general_protection_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    // The #GP error code carries the faulting segment selector in
+    // bits 15:3 (bit 0 = external event, bit 1 = IDT vs GDT/LDT), so
+    // print it decoded: the next boot log names the bad gate directly
+    // (2026-11-21: 0xfffa = selector index 0x1fff).
+    println!("EXCEPTION: GENERAL PROTECTION FAULT");
+    println!(
+        "Error Code: {:#x} (segment selector index {:#x}, {})",
+        error_code,
+        error_code >> 3,
+        if error_code & 1 == 1 { "external" } else { "internal" }
+    );
+    println!("{:#?}", stack_frame);
+    serial_println!("EXCEPTION: GENERAL PROTECTION FAULT");
+    serial_println!(
+        "Error Code: {:#x} (segment selector index {:#x}, {})",
+        error_code,
+        error_code >> 3,
+        if error_code & 1 == 1 { "external" } else { "internal" }
+    );
+    serial_println!("{:#?}", stack_frame);
+    hlt_loop();
+}
+
 extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: u64,
@@ -343,10 +572,17 @@ extern "x86-interrupt" fn page_fault_handler(
 ) {
     use x86_64::registers::control::Cr2;
 
+    // Mirror to serial as well as VGA: if the fault was on the VGA
+    // buffer itself (or VGA is unavailable), the VGA prints are
+    // no-ops and the serial log is the only record of the fault.
     println!("EXCEPTION: PAGE FAULT");
     println!("Accessed Address: {:?}", Cr2::read());
     println!("Error Code: {:?}", error_code);
     println!("{:#?}", stack_frame);
+    serial_println!("EXCEPTION: PAGE FAULT");
+    serial_println!("Accessed Address: {:?}", Cr2::read());
+    serial_println!("Error Code: {:?}", error_code);
+    serial_println!("{:#?}", stack_frame);
     hlt_loop();
 }
 
@@ -441,6 +677,80 @@ mod tests {
     fn timer_and_keyboard_state_start_empty() {
         assert_eq!(timer_ticks(), 0);
         assert_eq!(pop_key_event(), None);
+        assert_eq!(mode(), ControllerMode::Pic);
+    }
+
+    #[test]
+    fn idt_entries_carry_explicit_kernel_code_selector() {
+        // The kernel code segment is the first GDT entry after the
+        // null descriptor: index 1, value 0x08.
+        let cs = gdt::code_selector();
+        assert_eq!(cs.0, 0x08);
+        assert_eq!(cs.index(), 1);
+
+        let idt = build_idt(cs);
+        // Every installed entry must point at a real handler and carry
+        // the explicit selector — never whatever live CS the crate
+        // would otherwise read at build time (0xFFFA on the
+        // 2026-11-21 boot, which #GP'd the first timer IRQ). The
+        // Debug form prints `code_selector: SegmentSelector { index:
+        // 1, ... }` and `present: true` for a good gate.
+        let gates = [
+            format!("{:?}", idt.divide_error),
+            format!("{:?}", idt.debug),
+            format!("{:?}", idt.non_maskable_interrupt),
+            format!("{:?}", idt.breakpoint),
+            format!("{:?}", idt.overflow),
+            format!("{:?}", idt.bound_range_exceeded),
+            format!("{:?}", idt.invalid_opcode),
+            format!("{:?}", idt.device_not_available),
+            format!("{:?}", idt.double_fault),
+            format!("{:?}", idt.invalid_tss),
+            format!("{:?}", idt.segment_not_present),
+            format!("{:?}", idt.stack_segment_fault),
+            format!("{:?}", idt.general_protection_fault),
+            format!("{:?}", idt.page_fault),
+            format!("{:?}", idt.x87_floating_point),
+            format!("{:?}", idt.alignment_check),
+            format!("{:?}", idt.machine_check),
+            format!("{:?}", idt.simd_floating_point),
+            format!("{:?}", idt.virtualization),
+            format!("{:?}", idt.cp_protection_exception),
+            format!("{:?}", idt.hv_injection_exception),
+            format!("{:?}", idt.vmm_communication_exception),
+            format!("{:?}", idt.security_exception),
+            format!("{:?}", idt[TIMER_VECTOR]),
+            format!("{:?}", idt[KEYBOARD_VECTOR]),
+        ];
+        assert_eq!(gates.len(), 25);
+        for gate in &gates {
+            assert!(gate.contains("index: 1"), "gate lost its code selector: {gate}");
+            assert!(gate.contains("present: true"), "gate not present: {gate}");
+            assert!(
+                !gate.contains("handler_addr: 0x0"),
+                "gate has no handler: {gate}"
+            );
+        }
+        // The double-fault handler keeps its dedicated IST stack.
+        assert!(
+            gates[8].contains("stack_index: Some(0)"),
+            "double fault lost its IST stack: {}",
+            gates[8]
+        );
+    }
+
+    #[test]
+    fn apic_statics_start_unpopulated_and_mode_is_pic() {
+        // Boot is PIC-only by design: the LAPIC stays off until
+        // switch_to_apic_mode is actually called (enabling it while
+        // the PIC owned delivery #GP'd the first timer IRQ on
+        // 2026-11-21 — the interrupt arrived with no valid vector,
+        // v=ffffffff in the QEMU log). Nothing in the boot path may
+        // populate these anymore; switch_to_apic_mode is the only
+        // place that does.
+        assert!(LAPIC.lock().is_none(), "LAPIC populated before any APIC-mode switch");
+        assert!(IOAPIC.lock().is_none(), "IOAPIC populated before any APIC-mode switch");
+        assert_eq!(MODE.load(Ordering::SeqCst), 0, "delivery mode is not PIC at boot");
         assert_eq!(mode(), ControllerMode::Pic);
     }
 }

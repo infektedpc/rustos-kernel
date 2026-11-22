@@ -7,12 +7,22 @@ output, GDT + TSS, IDT, paging, and a heap.
 ## What it does at boot
 
 1. Receives `BootInfo` from the bootloader (`entry_point!`).
-2. Prints a banner on VGA and on serial COM1.
+2. Prints a banner on serial COM1 (port I/O cannot fault, so this
+   is safe before the IDT is up — and it proves the kernel started
+   even if everything after it goes wrong).
 3. Loads the GDT (kernel code segment + TSS with a dedicated
    double-fault stack) and the IDT (breakpoint, double-fault,
-   page-fault, timer, and keyboard handlers).
+   page-fault, timer, and keyboard handlers) **before any VGA
+   access**: the bootloader leaves its own IDT behind, unmapped in
+   the kernel's page tables, so a fault before this point
+   triple-faults.
 4. Builds an `OffsetPageTable` from the bootloader's physical-memory
-   mapping and a frame allocator from the `Usable` memory regions.
+   mapping and a frame allocator from the `Usable` memory regions,
+   then maps the VGA text buffer at `0xb8000` (identity-mapped,
+   PRESENT | WRITABLE | NO_CACHE) before the first VGA print. If the
+   mapping cannot be established, VGA output stays off and the
+   kernel runs serial-only — it never prints to VGA on a hope. Only
+   then does it print the banner on VGA.
 5. Maps a 100 KiB heap and proves it with `Box`, `Vec`, and `Rc`.
 6. Initialises interrupts (`interrupts::init_interrupts`): PIC
    remap (master -> 32, slave -> 40), PIT at 100 Hz, APIC MMIO
@@ -93,7 +103,9 @@ qemu-system-x86_64 -drive file=disk.img,format=raw \
 - `src/lib.rs` — `no_std`/`std` split, `print!`/`println!`,
   `serial_print!`/`serial_println!`, `hlt_loop`.
 - `src/vga.rs` — VGA text writer (0xb8000, 80x25).
-- `src/serial.rs` — COM1 serial writer (0x3F8).
+- `src/serial.rs` — COM1 serial writer (0x3F8) + polled serial input:
+  the idle loop drains waiting bytes and echoes printable ones back
+  over serial, so typing works in a `-serial stdio` terminal too.
 - `src/gdt.rs` — GDT + TSS + double-fault IST stack.
 - `src/interrupts.rs` — IDT (breakpoint, double-fault, page-fault,
   timer, keyboard) + controller setup: PIC remap, PIT 100 Hz, APIC
@@ -105,10 +117,21 @@ qemu-system-x86_64 -drive file=disk.img,format=raw \
 
 ## Known limitations
 
-- **VGA text output assumes a text buffer at 0xb8000.** That holds on
-  BIOS/SeaBIOS boot and VGA-compatible firmware, but a pure UEFI/GOP
-  boot has no text mode — there the serial log (`-serial stdio`) is the
-  output that works, and a framebuffer writer is still to be written.
+- **VGA text output is mapped by the kernel itself at boot.**
+  The bootloader never maps `0xb8000` under UEFI/GOP, and the first
+  VGA print used to page-fault on it — with the bootloader's IDT
+  still live, that faulted again reading the #DF gate and
+  triple-faulted (2026-11-21 reset loop on the user's box: RIP in
+  `Writer::write_byte`, CR2 = IDT base + 0x80). The kernel now loads
+  its own GDT + IDT before any VGA access and maps one page at
+  `0xb8000` before the first VGA print; if the mapping fails it runs
+  serial-only. A fault after that lands in the kernel's own #PF
+  handler (mirrored to serial) instead of a reset. **Open question:**
+  the first live boot (2026-11-21 ~13:32, old kernel) printed
+  uptime on VGA fine, so `0xb8000` was evidently usable then; what
+  changed is unknown — possibly OVMF memory-map variance between
+  boots, or the rebuilt bootloader's layout. The fix holds either
+  way: VGA is mapped by the kernel or not used at all.
 - **Timer/keyboard interrupts are in, but not live-boot tested.**
   The IDT has timer (vector 32) and keyboard (vector 33) handlers,
   the PIC is remapped, the PIT runs at 100 Hz, and the LAPIC is
@@ -118,6 +141,13 @@ qemu-system-x86_64 -drive file=disk.img,format=raw \
   (`switch_to_apic_mode`) is implemented but not called at boot and
   not verified on hardware. The APIC bases are defaults
   (0xFEE00000 / 0xFEC00000), not discovered from ACPI/MADT.
+- **Typing works two ways.** PS/2 keyboard input (IRQ1) echoes on
+  VGA — type in the QEMU display window. Serial input (COM1, polled
+  in the idle loop, no interrupt involved) echoes back over serial —
+  type in the terminal when booting with `-serial stdio -display
+  none`. Only printable ASCII echoes; CR/LF echo as CRLF; other
+  bytes are ignored. The echo policy is host unit-tested; the
+  actual port reads are not — the live boot is the proof.
 - **No tasks in the kernel yet.** The scheduler exists and the timer
   IRQ calls `tick()` on every tick, but the kernel creates no tasks,
   so `tick()` always returns `Continue` and `maybe_reschedule`
