@@ -32,6 +32,14 @@ use x86_64::{PhysAddr, VirtAddr};
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 /// Virtual address of the start of the kernel heap.
+///
+/// Deliberately distinctive (`0x4444…`): heap addresses are
+/// instantly recognizable in boot logs. The worker task's stack
+/// prints as `0x4444444402c0-0x4444444442c0`, which looks like a
+/// fill/uninitialized value but is a real heap address (heap start
+/// + 0x2c0 — the first allocations of the boot land just past the
+/// base). Do not "fix" the address: it is the heap base, not
+/// uninitialized memory.
 pub const HEAP_START: usize = 0x_4444_4444_0000;
 /// Size of the kernel heap, in bytes (100 KiB).
 pub const HEAP_SIZE: usize = 100 * 1024;

@@ -31,6 +31,21 @@ uart_16550 = "0.4"
 # and the scheduler the timer IRQ drives.
 rustos-interrupts = { path = "../rustos-interrupts" }
 rustos-scheduler = { path = "../rustos-scheduler" }
+# The syscall numbers shared with rustos-libc: rustos-process's
+# syscall table was verified firsthand to be identical to libc's
+# (read 0, write 1, open 2, close 3, yield 24, getpid 39, spawn 57,
+# exit 60, wait 61), and the kernel dispatcher re-exports those
+# constants (see src/syscall.rs) so the numbers can never drift.
+rustos-process = { path = "../rustos-process" }
+# The userspace startup handshake: the loader writes a
+# `rustos_libc::StartInfo` (heap base + size) onto the program's
+# initial stack (see src/userspace.rs).
+rustos-libc = { path = "../rustos-libc" }
+# The framebuffer console (Batch 10): pixel drawing (rustos-fb)
+# plus the terminal layer (rustos-tty) the kernel mirrors its
+# console output through (see src/fbcon.rs).
+rustos-fb = { path = "../rustos-fb" }
+rustos-tty = { path = "../rustos-tty" }
 # `spin_no_std` is required: without it lazy_static needs `std`, which
 # does not exist for x86_64-unknown-none.
 lazy_static = { version = "1.5", features = ["spin_no_std"] }

@@ -108,10 +108,40 @@ qemu-system-x86_64 -drive file=disk.img,format=raw \
   over serial, so typing works in a `-serial stdio` terminal too.
 - `src/gdt.rs` — GDT + TSS + double-fault IST stack.
 - `src/interrupts.rs` — IDT (breakpoint, double-fault, page-fault,
-  timer, keyboard) + controller setup: PIC remap, PIT 100 Hz, APIC
+  timer, keyboard, syscall) + controller setup: PIC remap, PIT 100 Hz, APIC
   init, IRQ0/IRQ1 unmask, `sti`; timer -> scheduler tick,
-  keyboard -> 64-entry event ring; `maybe_reschedule` for the idle
-  loop; `switch_to_apic_mode` (not called at boot — see below).
+  keyboard -> 64-entry event ring; `switch_to_apic_mode` (not called at boot — see below).
+  Also owns the task list: `init_tasks` (idle pid 0 + worker pid 1),
+  `add_user_task` (ring-3 tasks — a kernel stack for `TSS.rsp[0]` +
+  an iretq frame, see `src/userspace.rs`), `switch_to_task` /
+  `scheduler_yield` / `exit_current_task` (all update `TSS.rsp[0]`
+  before the register switch), and the fault policy: a fault in a
+  ring-3 task kills only that task (exit -1), a fault in the kernel
+  halts.
+- `src/syscall.rs` — syscalls on vector `0x80` (`int 0x80`, libc's
+  register convention: `rax` = number, `rdi`/`rsi`/`rdx` = args,
+  result in `rax`): assembly stub + Rust dispatcher. Implemented:
+  `write` (fd 1 -> serial + VGA, fd 2 -> serial), `read` (fd 0 ->
+  serial, non-blocking, `-EAGAIN` when empty), `exit` (terminates
+  the current task, switches to the next Ready task; exiting pid 0
+  halts), `getpid` (the running task's real pid), `yield` (switches
+  to the next Ready task now). `open`/`close`/`spawn`/`wait` and
+  unknown numbers return `-ENOSYS`. Numbers are re-exported from
+  `rustos-process`, whose table matches `rustos-libc` exactly.
+  Since Batch 11 the same dispatcher is also reached through the
+  `syscall` instruction (`src/fast_syscall.rs`: MSR entry +
+  `swapgs` stub + `sysret`); the boot self-test checks the MSRs
+  by read-back.
+  Buffers from a ring-3 caller are validated against the mapped
+  user regions (see `src/userspace.rs`) — a bad address is
+  `-EFAULT`, never a kernel `#PF`.
+- `src/userspace.rs` — the first userspace program (Batch 8): the
+  `rustos-hello` ELF embedded by `build.rs` (`OUT_DIR/hello`),
+  parsed with `rustos-process`'s ELF loader and mapped into
+  user-accessible pages (code at 0x400000, stack top 0x800000,
+  heap at 0x1000000), with the `StartInfo` (heap base + size)
+  written onto the initial user stack. Records every mapped user
+  interval for syscall buffer validation (`is_user_buffer`).
 - `src/memory.rs` — page-table init, `BootInfoFrameAllocator`, heap,
   `map_mmio_page` for device register pages (LAPIC/IOAPIC).
 
@@ -148,13 +178,23 @@ qemu-system-x86_64 -drive file=disk.img,format=raw \
   none`. Only printable ASCII echoes; CR/LF echo as CRLF; other
   bytes are ignored. The echo policy is host unit-tested; the
   actual port reads are not — the live boot is the proof.
-- **No tasks in the kernel yet.** The scheduler exists and the timer
-  IRQ calls `tick()` on every tick, but the kernel creates no tasks,
-  so `tick()` always returns `Continue` and `maybe_reschedule`
-  has nothing to switch to. Adding a first task (shell) is the next
-  step.
-- **No filesystem or userspace yet.** The heap, paging,
-  and exception handling in this repo are the foundation those build on.
+- **Tasks exist now (Batch 7/8).** The idle task (pid 0) and the
+  worker task (pid 1) are created at boot and preempted by the timer
+  IRQ; the first userspace program (`rustos-hello`) runs as a ring-3
+  task (pid 2). See `src/interrupts.rs` (`init_tasks`,
+  `add_user_task`) and `src/userspace.rs`.
+- **The `syscall` instruction is wired (Batch 11).** The kernel
+  programs `EFER.SCE`, `LSTAR` (the fast stub), `STAR`, `SFMASK`
+  (0x47700, Linux's mask) and the GS bases at boot, so ring-3
+  programs trap with the `syscall` instruction; `rustos-libc`'s
+  `RealBackend` is the default backend now and `int 0x80` is the
+  fallback (same dispatcher, both paths). The GDT puts the user
+  data segment one entry before user code — `sysret` needs it
+  (CS = STAR base + 16, SS = base + 8). The boot self-test reads
+  the MSRs back and prints the verdict; kernel code must never
+  issue `syscall` itself (`sysret` always returns to ring 3).
+- **No filesystem yet.** The heap, paging, tasks, and exception
+  handling in this repo are the foundation those build on.
 - **Not live-boot tested here.** QEMU is not installed in this sandbox,
   so the kernel is verified by `cargo build` for the target plus the
   host unit tests — not by an actual boot. The first real boot is the

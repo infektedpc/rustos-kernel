@@ -15,14 +15,19 @@
 
 extern crate alloc;
 
+pub mod fbcon;
+pub mod fast_syscall;
 pub mod gdt;
 pub mod interrupts;
 pub mod memory;
 pub mod serial;
+pub mod syscall;
+pub mod tasks;
+pub mod userspace;
 pub mod vga;
 
 /// Halt the CPU forever. Used by the panic handler and by fatal
-/// exception handlers: there is no scheduler to fall back to yet.
+/// exception handlers: a fault here has no safe context to resume.
 pub fn hlt_loop() -> ! {
     loop {
         x86_64::instructions::hlt();

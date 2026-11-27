@@ -69,6 +69,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustos-fb"
+version = "0.1.0"
+
+[[package]]
 name = "rustos-interrupts"
 version = "0.1.0"
 
@@ -79,16 +83,35 @@ dependencies = [
  "bootloader_api",
  "lazy_static",
  "linked_list_allocator",
+ "rustos-fb",
  "rustos-interrupts",
+ "rustos-libc",
+ "rustos-process",
  "rustos-scheduler",
+ "rustos-tty",
  "spin 0.10.1",
  "uart_16550",
  "x86_64",
 ]
 
 [[package]]
+name = "rustos-libc"
+version = "0.1.0"
+
+[[package]]
+name = "rustos-process"
+version = "0.1.0"
+
+[[package]]
 name = "rustos-scheduler"
 version = "0.1.0"
+
+[[package]]
+name = "rustos-tty"
+version = "0.1.0"
+dependencies = [
+ "rustos-fb",
+]
 
 [[package]]
 name = "rustversion"

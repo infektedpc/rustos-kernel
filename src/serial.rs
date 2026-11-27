@@ -60,9 +60,15 @@ lazy_static! {
 
 /// Write formatted arguments to COM1.
 /// Used by the `serial_print!` / `serial_println!` macros.
+///
+/// Holds [`crate::interrupts::IrqGuard`] while the port is locked:
+/// a tick preempting a print mid-line and switching to a ring-3
+/// task would deadlock (the task's `write` syscall spins on this
+/// lock with interrupts off) — see `IrqGuard` (Batch 8 wedge).
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
+    let _irq = crate::interrupts::IrqGuard::hold();
     SERIAL1
         .lock()
         .write_fmt(args)
@@ -71,7 +77,12 @@ pub fn _print(args: fmt::Arguments) {
 
 /// Read one byte from COM1 if one is waiting, without blocking.
 /// Returns `None` when the receive buffer is empty.
+///
+/// Holds [`crate::interrupts::IrqGuard`] while the port is locked,
+/// for the same reason as [`_print`]: this is called from the
+/// syscall read path (interrupts off) as well as from ring-0 code.
 pub fn try_read_byte() -> Option<u8> {
+    let _irq = crate::interrupts::IrqGuard::hold();
     SERIAL1.lock().try_receive().ok()
 }
 
@@ -82,7 +93,12 @@ pub fn try_read_byte() -> Option<u8> {
 /// and printing uptime. Called from the idle loop on every wake, which
 /// is ~100x/sec from the PIT. The hardware access itself cannot be
 /// host-tested; the echo policy is covered by [`echo_for`] tests.
+///
+/// Holds [`crate::interrupts::IrqGuard`] while the port is locked,
+/// for the same reason as [`_print`]: the idle loop runs with
+/// interrupts on and must not be preempted mid-drain.
 pub fn drain_serial_input() {
+    let _irq = crate::interrupts::IrqGuard::hold();
     let mut port = SERIAL1.lock();
     for _ in 0..MAX_DRAIN_PER_PASS {
         let byte = match port.try_receive() {

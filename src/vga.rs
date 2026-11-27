@@ -266,18 +266,33 @@ lazy_static! {
 /// Write formatted arguments to the global VGA writer.
 /// Used by the `print!` / `println!` macros.
 ///
-/// Silently drops the output while the VGA text buffer is unmapped
-/// (see `VGA_AVAILABLE` / [`init`]): writing to `0xb8000` before the
-/// kernel maps it page-faults, and a fault before the IDT is up is a
-/// triple fault. Serial output is a separate path (`crate::serial`)
-/// and is unaffected.
+/// Silently drops the VGA output while the VGA text buffer is
+/// unmapped (see `VGA_AVAILABLE` / [`init`]): writing to `0xb8000`
+/// before the kernel maps it page-faults, and a fault before the
+/// IDT is up is a triple fault. Serial output is a separate path
+/// (`crate::serial`) and is unaffected.
+///
+/// The framebuffer console is mirrored unconditionally (Batch 10):
+/// the same arguments go to the TTY layer through
+/// [`crate::fbcon::write_fmt`], so every kernel `println!` also
+/// renders on the GOP framebuffer. That write is a no-op while the
+/// fb console is uninitialised, so early prints (before
+/// `fbcon::init`) and serial-only boots are unaffected.
+///
+/// Holds [`crate::interrupts::IrqGuard`] while the writer is locked:
+/// a tick preempting a VGA print mid-line and switching to a ring-3
+/// task would deadlock (the task's `write` syscall spins on this
+/// lock with interrupts off) — see `IrqGuard` (Batch 8 wedge).
+/// Lock order is VGA then TTY; no path takes them the other way
+/// round.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    if !VGA_AVAILABLE.load(Ordering::SeqCst) {
-        return;
-    }
     use core::fmt::Write;
-    WRITER.lock().write_fmt(args).unwrap();
+    let _irq = crate::interrupts::IrqGuard::hold();
+    if VGA_AVAILABLE.load(Ordering::SeqCst) {
+        WRITER.lock().write_fmt(args).unwrap();
+    }
+    crate::fbcon::write_fmt(args);
 }
 
 #[cfg(test)]
